@@ -16,7 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, Update,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -27,10 +27,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = "8771434852:AAE7SY5_E0bfw5qyG15_-fPnnwba_5jCV98"
 ADMIN_IDS = {8061549073}          # твой Telegram ID, всегда админ
 BOT_USERNAME = "Kenyyt_bot"       # юзернейм бота без @
+CHANNEL_URL = "https://t.me/kenyaga"
+DB_PATH = "bot.db"
+
 TRAFSLY_TOKEN = "at_0b48947db56ac43395be0edda91d4895"
 TRAFSLY_BASE_URL = "https://api.trafsly.com"
-CHANNEL_URL = "https://t.me/kenyaga"   # ссылка на твой канал
-DB_PATH = "bot.db"
+
+PIARFLOW_BASE_URL = "https://piarflow.com/v1"
+PIARFLOW_API_KEY: str | None = None  # получаем автоматически при старте бота
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,9 +57,20 @@ async def init_db() -> None:
                 created_by INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 clicks INTEGER NOT NULL DEFAULT 0,
-                unlocks INTEGER NOT NULL DEFAULT 0
+                unlocks INTEGER NOT NULL DEFAULT 0,
+                sponsors_count INTEGER NOT NULL DEFAULT 5,
+                integration TEXT NOT NULL DEFAULT 'trafsly'
             )
         """)
+        # На случай апгрейда старой базы без новых колонок
+        for col, ddl in [
+            ("sponsors_count", "ALTER TABLE scripts ADD COLUMN sponsors_count INTEGER NOT NULL DEFAULT 5"),
+            ("integration", "ALTER TABLE scripts ADD COLUMN integration TEXT NOT NULL DEFAULT 'trafsly'"),
+        ]:
+            try:
+                await db.execute(ddl)
+            except Exception:
+                pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS pending_checks (
                 user_id INTEGER NOT NULL,
@@ -101,7 +116,7 @@ async def mark_blocked(user_id: int, blocked: bool) -> None:
         await db.commit()
 
 
-async def create_script(title: str, content: str, created_by: int) -> str:
+async def create_script(title: str, content: str, created_by: int, sponsors_count: int, integration: str) -> str:
     code = gen_code()
     async with aiosqlite.connect(DB_PATH) as db:
         while True:
@@ -110,8 +125,9 @@ async def create_script(title: str, content: str, created_by: int) -> str:
                 break
             code = gen_code()
         await db.execute(
-            "INSERT INTO scripts (code, title, content, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            (code, title, content, created_by, int(time.time())),
+            "INSERT INTO scripts (code, title, content, created_by, created_at, sponsors_count, integration) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (code, title, content, created_by, int(time.time()), sponsors_count, integration),
         )
         await db.commit()
     return code
@@ -236,16 +252,17 @@ async def all_active_user_ids() -> list[int]:
 #  TRAFSLY API
 # ======================================================================
 
-class TrafslyError(Exception):
+class SponsorServiceError(Exception):
     pass
 
 
-_HEADERS = {"Auth": TRAFSLY_TOKEN, "Content-Type": "application/json"}
+_TRAFSLY_HEADERS = {"Auth": TRAFSLY_TOKEN, "Content-Type": "application/json"}
 _TIMEOUT = httpx.Timeout(10.0)
 
 
-async def trafsly_get_sponsors(user_id: int, first_name=None, username=None, language_code=None, is_premium=False):
-    payload = {"user_id": user_id, "max_sponsors": 5, "is_premium": is_premium, "action": "subscribe"}
+async def trafsly_get_sponsors(user_id: int, count: int, first_name=None, username=None,
+                                language_code=None, is_premium=False) -> list[dict]:
+    payload = {"user_id": user_id, "max_sponsors": count, "is_premium": is_premium, "action": "subscribe"}
     if first_name:
         payload["first_name"] = first_name
     if username:
@@ -254,37 +271,198 @@ async def trafsly_get_sponsors(user_id: int, first_name=None, username=None, lan
         payload["language_code"] = language_code
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
-            resp = await client.post(f"{TRAFSLY_BASE_URL}/api/v1/get-sponsors", headers=_HEADERS, json=payload)
+            resp = await client.post(f"{TRAFSLY_BASE_URL}/api/v1/get-sponsors",
+                                      headers=_TRAFSLY_HEADERS, json=payload)
         except httpx.HTTPError as e:
-            raise TrafslyError(f"network error: {e}") from e
+            raise SponsorServiceError(f"trafsly network error: {e}") from e
     if resp.status_code != 200:
-        raise TrafslyError(f"HTTP {resp.status_code}: {resp.text}")
+        raise SponsorServiceError(f"trafsly HTTP {resp.status_code}: {resp.text}")
     data = resp.json()
-    logger.info("Trafsly raw response for %s: %s", user_id, data)
-    return data.get("sponsors", [])
+    raw = data.get("sponsors", [])
+    result = []
+    for sp in raw:
+        title = sp.get("title") or sp.get("name") or "Канал"
+        link = sp.get("link") or sp.get("url")
+        ads_id = sp.get("ads_id")
+        if not link:
+            continue
+        result.append({"source": "trafsly", "title": title, "link": link, "ads_id": ads_id})
+    return result
 
 
-async def trafsly_confirm(user_id: int, ads_id):
+async def trafsly_confirm(user_id: int, ads_id) -> bool:
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         try:
             resp = await client.post(
                 f"{TRAFSLY_BASE_URL}/api/v1/confirm-subscription",
-                headers=_HEADERS, json={"user_id": user_id, "ads_id": ads_id},
+                headers=_TRAFSLY_HEADERS, json={"user_id": user_id, "ads_id": ads_id},
             )
         except httpx.HTTPError as e:
-            raise TrafslyError(f"network error: {e}") from e
+            raise SponsorServiceError(f"trafsly network error: {e}") from e
     if resp.status_code != 200:
-        raise TrafslyError(f"HTTP {resp.status_code}: {resp.text}")
-    data = resp.json()
-    return {"subscribed": bool(data.get("subscribed", False))}
+        raise SponsorServiceError(f"trafsly HTTP {resp.status_code}: {resp.text}")
+    return bool(resp.json().get("subscribed", False))
 
 
-async def trafsly_balance():
+async def trafsly_balance() -> dict:
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(f"{TRAFSLY_BASE_URL}/api/v1/get-balance", headers=_HEADERS)
+        resp = await client.post(f"{TRAFSLY_BASE_URL}/api/v1/get-balance", headers=_TRAFSLY_HEADERS)
     if resp.status_code != 200:
-        raise TrafslyError(f"HTTP {resp.status_code}: {resp.text}")
+        raise SponsorServiceError(f"trafsly HTTP {resp.status_code}: {resp.text}")
     return resp.json()
+
+
+# ======================================================================
+#  PIARFLOW API
+# ======================================================================
+
+async def piarflow_fetch_api_key() -> None:
+    """Вызывается один раз при старте бота: получает API key автоматически по токену бота."""
+    global PIARFLOW_API_KEY
+    owner_id = next(iter(ADMIN_IDS))
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        try:
+            resp = await client.post(
+                f"{PIARFLOW_BASE_URL}/traffic_bot/api_key",
+                json={"bot_token": BOT_TOKEN, "chat_id": owner_id},
+                headers={"Content-Type": "application/json"},
+            )
+            data = resp.json()
+            if resp.status_code == 200 and data.get("status") == "ok":
+                PIARFLOW_API_KEY = data["api_key"]
+                logger.info("PiarFlow API key получен автоматически.")
+            else:
+                logger.warning("PiarFlow: не удалось получить api_key: %s", data)
+        except Exception as e:
+            logger.warning("PiarFlow: ошибка при получении api_key: %s", e)
+
+
+def _piarflow_headers() -> dict:
+    return {"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"}
+
+
+async def piarflow_get_sponsors(user_id: int, chat_id: int, count: int) -> list[dict]:
+    if not PIARFLOW_API_KEY:
+        raise SponsorServiceError("piarflow api key ещё не получен")
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        try:
+            resp = await client.post(
+                f"{PIARFLOW_BASE_URL}/sponsors",
+                headers=_piarflow_headers(),
+                json={"user_id": user_id, "chat_id": chat_id, "max_sponsors": count},
+            )
+        except httpx.HTTPError as e:
+            raise SponsorServiceError(f"piarflow network error: {e}") from e
+    if resp.status_code != 200:
+        raise SponsorServiceError(f"piarflow HTTP {resp.status_code}: {resp.text}")
+    data = resp.json()
+    raw = data.get("sponsors", [])
+    result = []
+    for i, sp in enumerate(raw, 1):
+        link = sp.get("link")
+        if not link:
+            continue
+        title = sp.get("title") or f"Задание {i}"
+        result.append({"source": "piarflow", "title": title, "link": link, "ads_id": None})
+    return result
+
+
+async def piarflow_check(user_id: int, links: list[str]) -> dict:
+    """Возвращает {link: True/False} — выполнено или нет."""
+    if not links:
+        return {}
+    if not PIARFLOW_API_KEY:
+        raise SponsorServiceError("piarflow api key ещё не получен")
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        try:
+            resp = await client.post(
+                f"{PIARFLOW_BASE_URL}/sponsors/check",
+                headers=_piarflow_headers(),
+                json={"user_id": user_id, "links": links},
+            )
+        except httpx.HTTPError as e:
+            raise SponsorServiceError(f"piarflow network error: {e}") from e
+    if resp.status_code != 200:
+        raise SponsorServiceError(f"piarflow HTTP {resp.status_code}: {resp.text}")
+    data = resp.json()
+    out = {}
+    for item in data.get("sponsors", []):
+        out[item.get("link")] = item.get("status") == "subscribed"
+    return out
+
+
+# ======================================================================
+#  ОБЪЕДИНЁННАЯ ЛОГИКА СПОНСОРОВ (Trafsly / PiarFlow / Mix)
+# ======================================================================
+
+async def fetch_sponsors_for_script(script: dict, user) -> list[dict]:
+    count = script.get("sponsors_count", 5) or 5
+    integration = script.get("integration", "trafsly") or "trafsly"
+    sponsors: list[dict] = []
+
+    if integration == "trafsly":
+        try:
+            sponsors = await trafsly_get_sponsors(
+                user.id, count, first_name=user.first_name, username=user.username,
+                language_code=user.language_code, is_premium=bool(getattr(user, "is_premium", False)),
+            )
+        except SponsorServiceError as e:
+            logger.warning("%s", e)
+
+    elif integration == "piarflow":
+        try:
+            sponsors = await piarflow_get_sponsors(user.id, user.id, count)
+        except SponsorServiceError as e:
+            logger.warning("%s", e)
+
+    elif integration == "mix":
+        half_t = (count + 1) // 2
+        half_p = count // 2
+        t_list, p_list = [], []
+        try:
+            t_list = await trafsly_get_sponsors(
+                user.id, half_t, first_name=user.first_name, username=user.username,
+                language_code=user.language_code, is_premium=bool(getattr(user, "is_premium", False)),
+            )
+        except SponsorServiceError as e:
+            logger.warning("%s", e)
+        try:
+            p_list = await piarflow_get_sponsors(user.id, user.id, half_p)
+        except SponsorServiceError as e:
+            logger.warning("%s", e)
+        sponsors = (t_list + p_list)[:count]
+
+    return sponsors[:count]
+
+
+async def check_sponsors(user_id: int, sponsors: list[dict]) -> list[dict]:
+    """Возвращает список ещё НЕ выполненных заданий из переданного списка."""
+    trafsly_items = [s for s in sponsors if s["source"] == "trafsly"]
+    piarflow_items = [s for s in sponsors if s["source"] == "piarflow"]
+    still_pending = []
+
+    for sp in trafsly_items:
+        if sp.get("ads_id") is None:
+            continue
+        try:
+            ok = await trafsly_confirm(user_id, sp["ads_id"])
+        except SponsorServiceError:
+            still_pending.append(sp)
+            continue
+        if not ok:
+            still_pending.append(sp)
+
+    if piarflow_items:
+        links = [sp["link"] for sp in piarflow_items]
+        try:
+            statuses = await piarflow_check(user_id, links)
+            for sp in piarflow_items:
+                if not statuses.get(sp["link"], False):
+                    still_pending.append(sp)
+        except SponsorServiceError:
+            still_pending.extend(piarflow_items)
+
+    return still_pending
 
 
 # ======================================================================
@@ -318,6 +496,23 @@ def kb_script_view(code: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def kb_sponsors_count() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for n in range(1, 11):
+        kb.button(text=str(n), callback_data=f"create:count:{n}")
+    kb.adjust(5)
+    return kb.as_markup()
+
+
+def kb_integration() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Trafsly", callback_data="create:integration:trafsly")
+    kb.button(text="PiarFlow", callback_data="create:integration:piarflow")
+    kb.button(text="Микс (и то и то)", callback_data="create:integration:mix")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def short_link_for(code: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start={code}"
 
@@ -325,11 +520,7 @@ def short_link_for(code: str) -> str:
 def kb_sponsors(sponsors: list[dict], script_code: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for sp in sponsors:
-        title = sp.get("title") or sp.get("name") or "Канал"
-        link = sp.get("link") or sp.get("url")
-        if not link:
-            continue
-        kb.button(text=f"📢 {title}", url=link)
+        kb.button(text=f"📢 {sp['title']}", url=sp["link"])
     kb.button(text="✅ Я подписался", callback_data=f"check:{script_code}")
     kb.adjust(1)
     return kb.as_markup()
@@ -349,6 +540,8 @@ def kb_channel() -> InlineKeyboardMarkup:
 class CreateScript(StatesGroup):
     waiting_title = State()
     waiting_content = State()
+    waiting_count = State()
+    waiting_integration = State()
 
 
 class Broadcast(StatesGroup):
@@ -386,22 +579,16 @@ async def send_script(target, script: dict) -> None:
     await target.answer(text, parse_mode="HTML", reply_markup=kb_channel())
 
 
-async def request_sponsors_and_show(message: Message, script_code: str) -> bool:
+async def request_sponsors_and_show(message: Message, script: dict) -> bool:
+    """Возвращает True, если пользователя можно пускать дальше без заданий."""
     user = message.from_user
-    try:
-        sponsors = await trafsly_get_sponsors(
-            user_id=user.id, first_name=user.first_name, username=user.username,
-            language_code=user.language_code, is_premium=bool(getattr(user, "is_premium", False)),
-        )
-    except TrafslyError as e:
-        logger.warning("get_sponsors failed, letting user through: %s", e)
-        return True
+    sponsors = await fetch_sponsors_for_script(script, user)
     if not sponsors:
         return True
-    await save_pending(user.id, script_code, sponsors)
+    await save_pending(user.id, script["code"], sponsors)
     await message.answer(
         "Чтобы получить скрипт, подпишись на спонсоров ниже, а затем нажми «Я подписался»:",
-        reply_markup=kb_sponsors(sponsors, script_code),
+        reply_markup=kb_sponsors(sponsors, script["code"]),
     )
     return False
 
@@ -420,7 +607,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         await message.answer("Эта ссылка недействительна или скрипт был удалён 😕")
         return
     await bump_clicks(payload)
-    can_proceed = await request_sponsors_and_show(message, payload)
+    can_proceed = await request_sponsors_and_show(message, script)
     if can_proceed:
         await send_script(message, script)
 
@@ -435,28 +622,20 @@ async def cb_check(call: CallbackQuery) -> None:
         return
     pending = await get_pending(user_id, script_code)
     if not pending:
-        can_proceed = await request_sponsors_and_show(call.message, script_code)
+        can_proceed = await request_sponsors_and_show(call.message, script)
         await call.answer()
         if can_proceed:
             await send_script(call.message, script)
         return
-    still_pending = []
-    for sp in pending:
-        ads_id = sp.get("ads_id")
-        if ads_id is None:
-            continue
-        try:
-            result = await trafsly_confirm(user_id, ads_id)
-        except TrafslyError:
-            still_pending.append(sp)
-            continue
-        if not result["subscribed"]:
-            still_pending.append(sp)
+
+    still_pending = await check_sponsors(user_id, pending)
+
     if still_pending:
         await save_pending(user_id, script_code, still_pending)
         await call.answer("Похоже, подписался не на всё. Проверь ещё раз ⤴️", show_alert=True)
         await call.message.edit_reply_markup(reply_markup=kb_sponsors(still_pending, script_code))
         return
+
     await clear_pending(user_id, script_code)
     await call.answer("Все подписки подтверждены ✅")
     await call.message.edit_text("✅ Все задания выполнены!")
@@ -498,6 +677,8 @@ async def cb_admin_menu(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
+# ---------- Создание скрипта: название -> текст -> кол-во спонсоров -> интеграция ----------
+
 @router.callback_query(F.data == "admin:create")
 async def cb_create_start(call: CallbackQuery, state: FSMContext) -> None:
     if not await is_admin(call.from_user.id):
@@ -528,14 +709,49 @@ async def create_content(message: Message, state: FSMContext) -> None:
     if not content:
         await message.answer("Не вижу текста скрипта. Пришли его текстовым сообщением:")
         return
+    await state.update_data(content=content)
+    await state.set_state(CreateScript.waiting_count)
+    await message.answer(
+        "На сколько спонсоров должен подписаться пользователь? Выбери от 1 до 10:",
+        reply_markup=kb_sponsors_count(),
+    )
+
+
+@router.callback_query(F.data.startswith("create:count:"), CreateScript.waiting_count)
+async def create_count(call: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(call.from_user.id):
+        return await call.answer()
+    count = int(call.data.split(":")[2])
+    await state.update_data(sponsors_count=count)
+    await state.set_state(CreateScript.waiting_integration)
+    await call.message.edit_text(
+        f"Количество спонсоров: {count}\n\nТеперь выбери интеграцию:",
+        reply_markup=kb_integration(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("create:integration:"), CreateScript.waiting_integration)
+async def create_integration(call: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(call.from_user.id):
+        return await call.answer()
+    integration = call.data.split(":")[2]  # trafsly / piarflow / mix
     data = await state.get_data()
-    code = await create_script(title=data["title"], content=content, created_by=message.from_user.id)
+    code = await create_script(
+        title=data["title"], content=data["content"], created_by=call.from_user.id,
+        sponsors_count=data["sponsors_count"], integration=integration,
+    )
     await state.clear()
     link = short_link_for(code)
-    await message.answer(
-        f"✅ Скрипт «{data['title']}» создан.\n\nКороткая ссылка:\n{link}",
+    integration_names = {"trafsly": "Trafsly", "piarflow": "PiarFlow", "mix": "Микс (Trafsly + PiarFlow)"}
+    await call.message.edit_text(
+        f"✅ Скрипт «{data['title']}» создан.\n\n"
+        f"Спонсоров: {data['sponsors_count']}\n"
+        f"Интеграция: {integration_names.get(integration, integration)}\n\n"
+        f"Короткая ссылка:\n{link}",
         reply_markup=kb_admin_main(),
     )
+    await call.answer()
 
 
 @router.callback_query(F.data == "admin:list")
@@ -561,8 +777,11 @@ async def cb_view(call: CallbackQuery) -> None:
         return
     link = short_link_for(code)
     preview = script["content"][:500]
+    integration_names = {"trafsly": "Trafsly", "piarflow": "PiarFlow", "mix": "Микс"}
     text = (
         f"📄 {script['title']}\nСсылка: {link}\n"
+        f"Спонсоров: {script.get('sponsors_count', 5)} | "
+        f"Интеграция: {integration_names.get(script.get('integration', 'trafsly'), '—')}\n"
         f"Переходов: {script['clicks']} | Разблокировок: {script['unlocks']}\n\n"
         f"<code>{preview}</code>"
     )
@@ -590,11 +809,11 @@ async def cb_balance(call: CallbackQuery) -> None:
         return await call.answer()
     try:
         data = await trafsly_balance()
-    except TrafslyError:
+    except SponsorServiceError:
         await call.answer("Не удалось получить баланс", show_alert=True)
         return
     await call.message.edit_text(
-        f"💰 Баланс: {data.get('balance', 0)} ₽\n⏳ В холде: {data.get('hold_balance', 0)} ₽",
+        f"💰 Баланс Trafsly: {data.get('balance', 0)} ₽\n⏳ В холде: {data.get('hold_balance', 0)} ₽",
         reply_markup=kb_admin_main(),
     )
     await call.answer()
@@ -606,10 +825,7 @@ async def cb_stats(call: CallbackQuery) -> None:
         return await call.answer()
     s = await get_stats()
     await call.message.edit_text(
-        f"📊 Статистика\n\n"
-        f"Юзеров в боте: {s['total']}\n"
-        f"За 24 часа: {s['last_24h']}\n"
-        f"За 7 дней: {s['last_7d']}",
+        f"📊 Статистика\n\nЮзеров в боте: {s['total']}\nЗа 24 часа: {s['last_24h']}\nЗа 7 дней: {s['last_7d']}",
         reply_markup=kb_admin_main(),
     )
     await call.answer()
@@ -695,7 +911,7 @@ async def do_broadcast(message: Message, state: FSMContext) -> None:
                 await mark_blocked(uid, True)
             else:
                 errors += 1
-        await asyncio.sleep(0.05)  # чтобы не упереться в лимиты Telegram
+        await asyncio.sleep(0.05)
 
     await status_msg.edit_text(
         f"Рассылка завершена:\n\n"
@@ -712,6 +928,8 @@ async def do_broadcast(message: Message, state: FSMContext) -> None:
 
 async def main() -> None:
     await init_db()
+    await piarflow_fetch_api_key()
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.outer_middleware(TrackUsersMiddleware())
